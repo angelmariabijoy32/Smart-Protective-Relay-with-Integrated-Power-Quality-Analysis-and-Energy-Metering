@@ -10,3 +10,5 @@ The energy metering function provides accurate measurement of power consumption 
 By integrating protection, monitoring, and energy metering into a single platform, the system reduces hardware complexity and cost while improving overall efficiency and reliability. Unlike traditional systems that require separate devices for each function, this solution offers a compact and scalable approach.
 
 This makes the proposed system suitable for smart homes, industrial monitoring, and modern energy management applications where safety, efficiency, and real-time data access are essential.
+<img width="584" height="354" alt="image" src="https://github.com/user-attachments/assets/1e0ab8ae-2ade-42f9-8316-75f039aa5145" />
+
