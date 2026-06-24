@@ -1,0 +1,1311 @@
+#include <stdio.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/dac_oneshot.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+#include <string.h>
+#include <stdbool.h>
+
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "esp_netif_types.h"
+
+void start_webserver(void);   // forward declaration
+
+/* =========================================================
+   CONSTANTS
+========================================================= */
+#define PI                     3.141592653589793f
+
+/* ---------------- SAMPLING ---------------- */
+#define FS                     3000.0f
+#define FFT_N                  60
+#define TIMER_US               (1000000/FS)
+
+
+
+/* ---------------- ADC ---------------- */
+
+#define VOLTAGE_ADC_CHANNEL    ADC_CHANNEL_6   // GPIO34
+#define CURRENT_ADC_CHANNEL    ADC_CHANNEL_4   // GPIO32
+#define ADC_BTN_CH ADC_CHANNEL_7               //  GPIO35 
+
+#define RELAY_GPIO 26   
+
+#define ADC_UNIT               ADC_UNIT_1
+
+#define VREF                   3.3f
+#define ADC_MAX                4095.0f
+#define DAC_MAX                255.0f
+
+#define DAC_BIAS               1.65f
+#define C_BIAS                 2.13f
+#define DAC_MAX_PEAK           1.65f
+
+#define VNOM                   12.0f
+#define INOM                   3.0f   
+
+#define CURRENT_SCALE   22.5f   
+#define VOLTAGE_SCALE   534.0f
+
+#define WIFI_SSID      "Redmi"
+#define WIFI_PASSWORD  "d23111718825"
+
+
+float TMS_C = 1.0f;
+float TMS_V = 1.0f;
+
+bool relay_tripped = false;
+int64_t trip_start_time = 0;
+float trip_delay = 0;
+int64_t trip_start_time_oc = 0;
+int64_t trip_start_time_ov = 0;
+
+/* ---------------- PROTECTION LIMITS ---------------- */
+float OV_LIMIT    =    200.0f;
+float UV_LIMIT    =    12.0f;
+float OC_LIMIT    =    13.0f;
+float OFREQ_LIMIT  =   52.0f;
+float UFREQ_LIMIT  =   48.0f;
+
+int selected_protection = -1; 
+
+/* -------- INSTANT TRIP LIMITS -------- */
+float OC_INST_LIMIT = 20.0f;   
+float OV_INST_LIMIT = 280.0f;
+float UV_INST_LIMIT = 5.0f;
+float OFREQ_INST_LIMIT = 55.0f;
+float UFREQ_INST_LIMIT = 45.0f;
+
+/* ===== SAG / SWELL STATUS ===== */
+char v_sag_status[10] = "NORMAL";
+char i_sag_status[10] = "NORMAL";
+
+/* ---------------- LCD PINS ---------------- */
+#define LCD_RS 21
+#define LCD_EN 22
+#define LCD_D4 18
+#define LCD_D5 19
+#define LCD_D6 23
+#define LCD_D7 5
+
+typedef enum {
+    DISP_1, DISP_2, DISP_3, DISP_4,
+    DISP_5, DISP_6, DISP_7, DISP_8, DISP_9
+} menu_t;
+
+/* ---------------- GLOBAL VARIABLES ---------------- */
+menu_t current_menu = DISP_1;
+int menu_index = 0;
+int pq_page_index = 0;
+int keypad_cursor = 0;
+int lcd_refresh_required = 1;
+char input_buffer[10] = {0};
+int input_pos = 0;
+int last_button = 0;
+bool menu_changed = true;
+//int current = 0;
+int val = 0;
+
+const char* keypad_str = "V0123456789.<V";
+
+const char* pq_options[] = {
+    "Freq",
+    "RMS",
+    "THD",
+    "Fundamental","SAG/SWELL"
+};
+#define PQ_TOTAL 5
+
+/* ===== PQ GLOBAL RESULTS ===== */
+float freq = 0;
+float freq_i = 0;
+float v_rms = 0;
+float i_rms = 0;
+float thd_v = 0;
+float thd_i = 0;
+float fund = 0;
+float fund_v = 0;
+float fund_i = 0;
+float P = 0;
+float Q = 0;
+float S = 0;
+float PF = 0;
+
+float max = 0.0f;
+int k_fund = 0;
+/* =========================================================
+   GLOBALS
+========================================================= */
+static adc_oneshot_unit_handle_t adc_handle;
+static esp_timer_handle_t timer_handle;
+
+static float v_buffer[FFT_N];
+static float i_buffer[FFT_N];
+
+static float Re_v[FFT_N], Im_v[FFT_N], Mag_v[FFT_N];
+static float Re_i[FFT_N], Im_i[FFT_N], Mag_i[FFT_N];
+
+static volatile int sample_index = 0;
+static volatile bool sampling_done = false;
+
+/* =========================================================
+   WIFI + WEBSERVER
+========================================================= */
+static httpd_handle_t server = NULL;
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect(); // Start connection
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        printf("WiFi Disconnected. Retrying...\n");
+        esp_wifi_connect(); // Retry if dropped
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+        printf("\nConnected! IP Address: " IPSTR "\n", IP2STR(&event->ip_info.ip));
+        start_webserver(); 
+    }
+}
+
+void wifi_init_sta(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+	
+esp_event_handler_instance_t instance_any_id;
+esp_event_handler_instance_t instance_got_ip;
+
+esp_event_handler_instance_register(WIFI_EVENT,
+                                    ESP_EVENT_ANY_ID,
+                                    &wifi_event_handler,
+                                    NULL,
+                                    &instance_any_id);
+
+esp_event_handler_instance_register(IP_EVENT,
+                                    IP_EVENT_STA_GOT_IP,
+                                    &wifi_event_handler,
+                                    NULL,
+                                    &instance_got_ip);
+
+    wifi_config_t wifi_config = {};
+    strncpy((char*)wifi_config.sta.ssid,     WIFI_SSID,     sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password));
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+    esp_wifi_connect();
+
+    printf("WiFi connecting to %s...\n", WIFI_SSID);
+}
+
+static esp_err_t data_get_handler(httpd_req_t *req)
+{
+    char json[512];
+
+    char v_status[10] = "GOOD";
+    char i_status[10] = "GOOD";
+    char f_status[10] = "GOOD";
+    char relay_status[10] = "CLOSED";
+
+    if (v_rms > OV_LIMIT)        strcpy(v_status, "OVER");
+    else if (v_rms < UV_LIMIT && v_rms > 50.0f)   strcpy(v_status, "UNDER");
+
+    if (i_rms > OC_LIMIT)        strcpy(i_status, "OVER");
+
+    if (freq > OFREQ_LIMIT)      strcpy(f_status, "OVER");
+    else if (freq < UFREQ_LIMIT && freq > 2.0f) strcpy(f_status, "UNDER");
+
+    if (relay_tripped)           strcpy(relay_status, "TRIPPED");
+
+    snprintf(json, sizeof(json),
+        "{"
+        "\"freq\":%.2f,"
+        "\"freq_i\":%.2f,"
+        "\"v_rms\":%.2f,"
+        "\"i_rms\":%.2f,"
+        "\"thd_v\":%.3f,"
+        "\"thd_i\":%.3f,"
+        "\"fund_v\":%.2f,"
+        "\"fund_i\":%.2f,"
+        "\"P\":%.2f,"
+        "\"Q\":%.2f,"
+        "\"S\":%.2f,"
+        "\"PF\":%.3f,"
+        "\"v_status\":\"%s\","
+        "\"i_status\":\"%s\","
+        "\"f_status\":\"%s\","
+        "\"relay\":\"%s\","
+        "\"v_sag\":\"%s\","
+        "\"i_sag\":\"%s\","
+        "\"ov_limit\":%.2f,"
+        "\"uv_limit\":%.2f,"
+        "\"oc_limit\":%.2f,"
+        "\"of_limit\":%.2f,"
+        "\"uf_limit\":%.2f"
+        "}",
+        freq, freq_i,
+        v_rms, i_rms,
+        thd_v, thd_i,
+        fund_v / 1.414f, fund_i / 1.414f,
+        P, Q, S, PF,
+        v_status, i_status, f_status,
+        relay_status,
+        v_sag_status, i_sag_status,
+        OV_LIMIT, UV_LIMIT, OC_LIMIT, OFREQ_LIMIT, UFREQ_LIMIT
+    );
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+void start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t data_uri = {
+            .uri      = "/data",
+            .method   = HTTP_GET,
+            .handler  = data_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &data_uri);
+        printf("Web server started on port 80\n");
+        printf("Open dashboard and enter ESP32 IP shown above\n");
+    }
+}
+
+
+/* ---------------- LCD DRIVER ---------------- */
+void lcd_enable() {
+    gpio_set_level(LCD_EN, 1);
+    esp_rom_delay_us(1);
+    gpio_set_level(LCD_EN, 0);
+    esp_rom_delay_us(100);
+}
+
+void lcd_send4(uint8_t data) {
+    gpio_set_level(LCD_D4, (data >> 0) & 1);
+    gpio_set_level(LCD_D5, (data >> 1) & 1);
+    gpio_set_level(LCD_D6, (data >> 2) & 1);
+    gpio_set_level(LCD_D7, (data >> 3) & 1);
+    lcd_enable();
+}
+
+void lcd_cmd(uint8_t cmd) {
+    gpio_set_level(LCD_RS, 0);
+    lcd_send4(cmd >> 4);
+    lcd_send4(cmd & 0x0F);
+    esp_rom_delay_us(2000);
+}
+
+void lcd_clear(void) {
+    lcd_cmd(0x01);
+    vTaskDelay(pdMS_TO_TICKS(2));   
+}
+
+
+void lcd_data(uint8_t data) {
+    gpio_set_level(LCD_RS, 1);
+    lcd_send4(data >> 4);
+    lcd_send4(data & 0x0F);
+}
+
+void lcd_init() {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL<<LCD_RS)|(1ULL<<LCD_EN)|
+                        (1ULL<<LCD_D4)|(1ULL<<LCD_D5)|
+                        (1ULL<<LCD_D6)|(1ULL<<LCD_D7),
+        .mode = GPIO_MODE_OUTPUT
+    };
+    gpio_config(&io_conf);
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcd_send4(0x03); vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_send4(0x03); vTaskDelay(pdMS_TO_TICKS(1));
+    lcd_send4(0x03);
+    lcd_send4(0x02);
+
+    lcd_cmd(0x28);
+    lcd_cmd(0x0C);
+    lcd_cmd(0x06);
+    lcd_cmd(0x01);
+}
+
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+    lcd_cmd((row == 0 ? 0x80 : 0xC0) + col);
+}
+
+void lcd_print(const char *str) {
+    while (*str) lcd_data(*str++);
+}
+
+/* ---------------- BUTTON INPUT ---------------- */
+
+int read_button(void)
+	{
+    	//int val = 0;
+    	adc_oneshot_read(adc_handle, ADC_BTN_CH, &val);
+    	
+
+    	int current = 0;
+    	
+		if (val > 4010) current = 0;
+    	else if ( val < 300) current = 1;
+    	else if (val < 900) current = 2;
+    	else if (val < 1600) current = 3;
+    	else if (val < 2400) current = 4;
+    	else if (val < 4000) current = 5;
+
+    	if (current == last_button) return 0;
+    	last_button = current;
+    	return current;
+}
+void printing(int pq_page_index)
+{
+    char buf[16],buf2[16];
+
+   
+    if (pq_page_index == 0){
+    	lcd_set_cursor(0,3);
+        snprintf(buf,sizeof(buf),"%.2f Hz",freq);
+        lcd_print(buf);
+        lcd_set_cursor(1,3);
+        snprintf(buf2,sizeof(buf2),"%.2f Hz",freq_i);
+        lcd_print(buf2);
+     }
+    else if (pq_page_index == 1){        
+        lcd_set_cursor(0,3);
+        snprintf(buf,sizeof(buf),"%.2f V",v_rms);
+        lcd_print(buf);
+        lcd_set_cursor(1,3);
+        snprintf(buf2,sizeof(buf2),"%.2f V",i_rms);
+        lcd_print(buf2);
+     }
+    else if (pq_page_index == 2){ 
+        lcd_set_cursor(0,3);
+        snprintf(buf,sizeof(buf),"%2.2f %%",thd_v * 100.0f);
+        lcd_print(buf);
+        lcd_set_cursor(1,3);
+        snprintf(buf2,sizeof(buf2),"%2.2f %%",thd_i * 100.0f);
+        lcd_print(buf2);
+     }
+    else if (pq_page_index == 3){
+        lcd_set_cursor(0,3);
+        snprintf(buf,sizeof(buf),"%.2f V",fund_v);
+        lcd_print(buf);
+        lcd_set_cursor(1,3);
+        snprintf(buf2,sizeof(buf2),"%.2f V",fund_i);
+        lcd_print(buf2);
+	}
+	else if (pq_page_index == 4) // SAG/SWELL
+{
+    lcd_set_cursor(0,3);
+    lcd_print(v_sag_status);
+
+    lcd_set_cursor(1,3);
+    lcd_print(i_sag_status);
+}
+    
+    
+}
+
+void energy_printing(int menu_index)
+{
+    char buf[16],buf2[16];
+
+   
+    if (menu_index == 0){
+    	lcd_set_cursor(0,9);
+        snprintf(buf,sizeof(buf),"%.2f W",P);
+        lcd_print(buf);
+        lcd_set_cursor(1,4);
+        snprintf(buf2,sizeof(buf2),"%.3f ",PF);
+        lcd_print(buf2);
+     }
+    else if (menu_index == 1){
+    	lcd_set_cursor(0,7);
+        snprintf(buf,sizeof(buf),"%.2f VA",S);
+        lcd_print(buf);
+        lcd_set_cursor(1,6);
+        snprintf(buf2,sizeof(buf2),"%.2f VAR ",Q);
+        lcd_print(buf2);
+     }
+}
+/* ---------------- LCD MENU ---------------- */
+void lcd_menu(void *arg){
+
+    
+
+    while (1) {
+
+        int btn = read_button();
+        
+
+        /* -------- DISPLAY 1 -------- */
+        if (current_menu == DISP_1) {
+            lcd_cmd(0x01);
+            lcd_print("Protective Relay");
+            lcd_set_cursor(1, 0);
+            lcd_print("with PQ Analysis");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            current_menu = DISP_2;
+            menu_changed = true;
+        }
+
+        /* -------- LEFT = BACK (Except DISP_8) -------- */
+        if (btn == 4 && current_menu != DISP_8 &&
+            current_menu != DISP_1 && current_menu != DISP_2) {
+
+            if (current_menu == DISP_7 || current_menu == DISP_6)
+                current_menu = DISP_3;
+            else if (current_menu == DISP_5)
+                current_menu = DISP_4;
+            else
+                current_menu = DISP_2;
+
+            menu_index = 0;
+            menu_changed = true;
+            lcd_cmd(0x0C); //display on cursor off
+        }
+        
+
+        /* -------- DISPLAY UPDATE -------- */
+        if (menu_changed) {
+            lcd_cmd(0x01);
+
+            switch (current_menu) {
+
+            case DISP_1: break;
+
+            case DISP_2:
+
+
+				if (menu_index == 0){
+    				lcd_set_cursor(0,0);
+    				lcd_print(">Protection");
+    				lcd_set_cursor(1,0);
+    				lcd_print(" PQ Analysis");
+				}
+				else if (menu_index == 1){
+    				lcd_set_cursor(0,0);
+    				lcd_print(" Protection");
+    				lcd_set_cursor(1,0);
+    				lcd_print(">PQ Analysis");
+				}
+				else if (menu_index == 2){
+    				lcd_set_cursor(0,0);
+    				lcd_print(" PQ Analysis");
+    				lcd_set_cursor(1,0);
+    				lcd_print(">Energy Meter");
+				}
+
+                break;
+
+            case DISP_3:
+                lcd_print(menu_index==0?">Change Thresh":" Change Thresh");
+                lcd_set_cursor(1,0);
+                lcd_print(menu_index==1?">Prot Check":" Prot Check");
+                break;
+
+            case DISP_4: {
+                int t = pq_page_index;
+                if (t == 0 || t == 1){
+					lcd_cmd(0x01);
+					lcd_set_cursor(0, 0); 
+                	lcd_print(t == 0 ? ">Freq" : " Freq");
+                	lcd_set_cursor(1, 0);
+                	lcd_print(t == 1 ? ">RMS" : " RMS");
+                	lcd_set_cursor(1, 15);
+                	lcd_print("v");                	
+				}
+				
+                if (t == 2 || t == 3){
+					lcd_cmd(0x01);
+                	lcd_set_cursor(0, 0); 
+                	lcd_print(t == 2 ? ">THD" : " THD");
+                	lcd_set_cursor(1, 0);
+                	lcd_print(t == 3 ? ">Fundamental" : " Fundamental");
+                	lcd_set_cursor(0, 15);
+                	lcd_print("^");
+                	lcd_set_cursor(1, 15);
+                	lcd_print("v");
+                }
+                
+                if (t == 4){
+					lcd_cmd(0x01);
+                	lcd_set_cursor(0, 0); 
+                	lcd_print(t == 4 ? ">SAG/SWELL" : " SAG/SWELL");
+                	lcd_set_cursor(1, 0);
+                	lcd_print("");
+                	lcd_set_cursor(0, 15);
+                	lcd_print("^");
+                }
+                
+                break;
+            }
+
+
+            case DISP_5:
+                //lcd_print(pq_options[pq_page_index]);
+                lcd_print("V:");             
+                lcd_set_cursor(1,0);
+                lcd_print("I:");                
+                printing(pq_page_index);
+                break;
+
+            case DISP_6: {
+
+    char v_status[10] = "GOOD";
+    char i_status[10] = "GOOD";
+    char f_status[10] = "GOOD";
+
+    /* -------- VOLTAGE STATUS -------- */
+    if (v_rms > OV_LIMIT)
+        strcpy(v_status, "OVER");
+    
+    else if (v_rms == 0.0f)
+        strcpy(v_status, "OFF");
+    else if (v_rms < UV_LIMIT)
+        strcpy(v_status, "UNDER");
+
+    /* -------- CURRENT STATUS -------- */
+    if (i_rms > OC_LIMIT)
+        strcpy(i_status, "OVER");
+    else if (i_rms == 0.0f)
+        strcpy(f_status, "OFF");
+
+    /* -------- FREQUENCY STATUS -------- */
+    if (freq > OFREQ_LIMIT)
+        strcpy(f_status, "OVER");    
+    else if (freq == 0.0f)
+        strcpy(f_status, "OFF");
+    else if (freq < UFREQ_LIMIT)
+        strcpy(f_status, "UNDER");
+
+    /* -------- DISPLAY -------- */
+    lcd_set_cursor(0,0);
+    lcd_print("V:");
+    lcd_print(v_status);
+
+    lcd_set_cursor(1,0);
+    lcd_print("I: ");
+    lcd_print(i_status);
+
+    lcd_set_cursor(0,8);
+    lcd_print("F: ");
+    lcd_print(f_status);
+
+    break;
+}
+
+            case DISP_7:                              
+                if (menu_index == 0 || menu_index == 1){
+					lcd_cmd(0x01);
+					lcd_set_cursor(0, 0); 
+                	lcd_print(menu_index == 0 ? ">OverCurrent" : " OverCurrent");
+                	lcd_set_cursor(1, 0);
+                	lcd_print(menu_index == 1 ? ">OverVoltage" : " OverVoltage");
+                	lcd_set_cursor(1, 15);
+                	lcd_print("v");                	
+				}
+				
+                else if (menu_index == 2 || menu_index == 3){
+					lcd_cmd(0x01);
+                	lcd_set_cursor(0, 0); 
+                	lcd_print(menu_index == 2 ? ">UnderVoltage" : " UnderVoltage");
+                	lcd_set_cursor(1, 0);
+                	lcd_print(menu_index == 3 ? ">OverFreq" : " OverFreq");
+                	lcd_set_cursor(0, 15);
+                	lcd_print("^");
+                	lcd_set_cursor(1, 15);
+                	lcd_print("v");
+                }
+                else{
+					lcd_cmd(0x01);
+                	lcd_set_cursor(0, 0); 
+                	lcd_print(menu_index == 4 ? ">OC_INST_LIMIT" : " OC_INST_LIMIT");
+                	lcd_set_cursor(1, 0);
+                	lcd_print("");
+                	lcd_set_cursor(0, 15);
+                	lcd_print("^");                	
+				}
+                break;
+               
+             case DISP_8:
+
+    			if (lcd_refresh_required)   
+   		 		{
+        			lcd_clear();
+
+        			lcd_set_cursor(0, 0);
+        			lcd_print(keypad_str);    			
+        			
+        			lcd_set_cursor(1, 0);
+        			lcd_print(input_buffer);
+
+        			lcd_refresh_required = 0;
+    			}
+				
+    			lcd_set_cursor(0, keypad_cursor); 
+    			lcd_cmd(0x0F);
+    			break;
+
+			case DISP_9:
+				lcd_cmd(0x01);
+				lcd_set_cursor(0, 0); 
+                lcd_print(menu_index == 0 ? "Activ P:" : "App P:");
+                
+                lcd_set_cursor(1, 0);
+                lcd_print(menu_index == 1 ? "Rea P:" : "PF:");
+                energy_printing(menu_index);
+
+
+            default: break;
+            }
+
+            menu_changed = false;
+        }
+
+        /* -------- NAVIGATION -------- */
+        if (btn == 2) {
+            if ((current_menu==DISP_2||current_menu==DISP_3||current_menu==DISP_7
+                                    ||current_menu==DISP_9) && menu_index>0)
+                menu_index--;
+            else if (current_menu==DISP_4 && pq_page_index>0){
+				
+				pq_page_index--;
+				
+			}
+                
+            menu_changed = true;
+        }
+
+        if (btn == 3) {
+            if (current_menu==DISP_2 && menu_index<2)
+                menu_index++;
+            else if(current_menu==DISP_3 && menu_index<1)
+            	menu_index++;
+            else if (current_menu==DISP_7 && menu_index<4){
+				menu_index++;
+			}
+			else if (current_menu==DISP_9 && menu_index<1){
+				menu_index++;
+			}
+            else if (current_menu==DISP_4 && pq_page_index<PQ_TOTAL-1){
+            	
+                pq_page_index++;
+                
+            }
+            menu_changed = true;
+        }
+
+        /* -------- KEYPAD LEFT / RIGHT -------- */
+        if (current_menu == DISP_8) {
+
+    		if (btn == 1 && keypad_cursor < 13) {
+        		keypad_cursor++;
+        		lcd_set_cursor(0, keypad_cursor);   
+        		lcd_cmd(0x0F);
+        		
+    		}
+
+    		if (btn == 4 && keypad_cursor > 0) {
+        		keypad_cursor--;
+        		lcd_set_cursor(0, keypad_cursor);   
+        		lcd_cmd(0x0F);
+    		}
+		}
+
+
+        /* -------- SELECT -------- */
+        if (btn == 5) {
+
+            if (current_menu == DISP_2)
+			{
+    			if (menu_index == 0)   current_menu = DISP_3;
+    		else if (menu_index == 1)  current_menu = DISP_4;
+    		else     current_menu = DISP_9;
+			}
+
+            else if (current_menu == DISP_3)
+                current_menu = (menu_index==0)?DISP_7:DISP_6;
+
+            else if (current_menu == DISP_4)
+                current_menu = DISP_5;
+
+            else if (current_menu == DISP_7) {
+
+    selected_protection = menu_index;   // ⭐ SAVE selection
+
+    current_menu = DISP_8;
+    keypad_cursor = input_pos = 0;
+    memset(input_buffer,0,sizeof(input_buffer));
+}
+
+            else if (current_menu == DISP_8) {
+
+    			char c = keypad_str[keypad_cursor];
+
+    			if (c == 'V') {
+
+    float value = atof(input_buffer);   // ⭐ convert input
+
+    switch(selected_protection)
+    {
+        case 0:  // OverCurrent
+            OC_LIMIT = value;
+            break;
+
+        case 1:  // OverVoltage
+            OV_LIMIT = value;
+            break;
+
+        case 2:  // UnderVoltage
+            UV_LIMIT = value;
+            break;
+
+        case 3:  // OverFreq
+            OFREQ_LIMIT = value;
+            break;
+
+        case 4:  // c limit instant
+            OC_INST_LIMIT = value;
+            break;
+    }
+
+    current_menu = DISP_7;
+    menu_changed = true;
+    lcd_refresh_required = 1;
+}
+
+    			else {
+        			if (c == '<' && input_pos > 0)
+            			input_buffer[--input_pos] = 0;
+        			else if (input_pos < 9)
+            			input_buffer[input_pos++] = c;
+
+        			lcd_refresh_required = 1;   
+        			menu_changed = true;
+    			}
+			}
+
+
+            menu_index = 0;
+            menu_changed = true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+
+
+
+/* =========================================================
+   FFT FUNCTION
+========================================================= */
+void compute_fft(float *buffer, float *Re, float *Im, float *Mag)
+{
+    for (int k = 0; k < FFT_N; k++)
+    {
+        Re[k] = 0;
+        Im[k] = 0;
+
+        for (int n = 0; n < FFT_N; n++)
+        {
+            float angle = 2.0f * PI * k * n / FFT_N;
+            Re[k] += buffer[n] * cosf(angle);
+            Im[k] -= buffer[n] * sinf(angle);
+        }
+
+        Mag[k] = sqrtf(Re[k]*Re[k] + Im[k]*Im[k]);
+    }
+	
+	
+    for (int k = 1; k < FFT_N/2; k++){
+    	if (k == 1){Mag[k] *= (2.0f / FFT_N);}
+        else{Mag[k] *= (2.0f / (FFT_N*10)); }
+    }
+}
+
+/* =========================================================
+   IDMT
+========================================================= */
+void idmt_protection(float current,float v_rms)
+{
+    if (current > OC_LIMIT)
+    {
+        float ratio = current / OC_LIMIT;
+
+        if (ratio > 1.01f)   // avoid divide issue
+        {
+            trip_delay = (0.14f * TMS_C) / (powf(ratio, 0.02f) - 1.0f);
+
+            if (trip_start_time_oc == 0)
+                trip_start_time_oc = esp_timer_get_time(); // µs
+
+            int64_t elapsed_us = esp_timer_get_time() - trip_start_time_oc;
+
+            if (elapsed_us >= (int64_t)(trip_delay * 1e6))
+            {
+                gpio_set_level(RELAY_GPIO, 1);  // TRIP
+                relay_tripped = true;
+            }
+        }
+    }
+    
+  if (v_rms > OV_LIMIT)
+    {
+        float ratio = v_rms / OV_LIMIT;
+
+        if (ratio > 1.01f)   // avoid divide issue
+        {
+            trip_delay = (0.14f * TMS_V) / (powf(ratio, 0.02f) - 1.0f);
+
+            if (trip_start_time_ov == 0)
+                trip_start_time_ov = esp_timer_get_time(); // µs
+
+            int64_t elapsed_us = esp_timer_get_time() - trip_start_time_ov;
+
+            if (elapsed_us >= (int64_t)(trip_delay * 1e6))
+            {
+                gpio_set_level(RELAY_GPIO, 1);  // TRIP
+                relay_tripped = true;
+            }
+        }
+    }
+    
+}
+
+/* =========================================================
+   INSTANTANEOUS PROTECTION
+========================================================= */
+void instant_protection(float current, float voltage, float frequency)
+{
+    if (relay_tripped) return;  // already tripped
+
+    /* -------- OVER CURRENT -------- */
+    if (current > OC_INST_LIMIT)
+    {
+        printf("INSTANT OVER CURRENT TRIP!\n");
+        gpio_set_level(RELAY_GPIO, 1);
+        relay_tripped = true;
+    }
+
+    /* -------- OVER VOLTAGE -------- */
+    if (voltage > OV_INST_LIMIT)
+    {
+        printf("INSTANT OVER VOLTAGE TRIP!\n");
+        gpio_set_level(RELAY_GPIO, 1);
+        relay_tripped = true;
+    }
+
+    /* -------- UNDER VOLTAGE -------- */
+  /*  if (voltage < UV_INST_LIMIT && voltage > 10.0f)
+    {
+        printf("INSTANT UNDER VOLTAGE TRIP!\n");
+        gpio_set_level(RELAY_GPIO, 1);
+        relay_tripped = true;
+    }*/
+
+    /* -------- OVER FREQUENCY -------- */
+  /*  if (frequency > OFREQ_INST_LIMIT)
+    {
+        printf("INSTANT OVER FREQUENCY TRIP!\n");
+        gpio_set_level(RELAY_GPIO, 1);
+        relay_tripped = true;
+    }*/
+
+    /* -------- UNDER FREQUENCY -------- */
+ /*   if (frequency < UFREQ_INST_LIMIT && frequency > 0)
+    {
+        printf("INSTANT UNDER FREQUENCY TRIP!\n");
+        gpio_set_level(RELAY_GPIO, 1);
+        relay_tripped = true;
+    }*/
+}
+
+/* =========================================================
+   TIMER CALLBACK
+========================================================= */
+static void sampling_timer_cb(void *arg)
+{
+    if (sample_index >= FFT_N)
+    {
+        sampling_done = true;
+        esp_timer_stop(timer_handle);
+        return;
+    }
+
+    /* -------- READ VOLTAGE ADC (ZMPT101B) -------- */
+    int adc_raw_v;
+    adc_oneshot_read(adc_handle, VOLTAGE_ADC_CHANNEL, &adc_raw_v);
+
+    float v_adc = ((float)adc_raw_v / ADC_MAX) * VREF;
+
+    /* Remove DC offset (centered at 1.65V) */
+    v_adc = v_adc - DAC_BIAS;
+
+    /* Scale to actual voltage */
+    v_buffer[sample_index] = v_adc * VOLTAGE_SCALE;
+
+
+    /* -------- READ CURRENT ADC (SCT-013) -------- */
+    int adc_raw_i;
+    adc_oneshot_read(adc_handle, CURRENT_ADC_CHANNEL, &adc_raw_i);
+
+    float i_adc = ((float)adc_raw_i / ADC_MAX) * VREF;
+
+    /* Remove DC offset */
+    i_adc = i_adc - C_BIAS ;
+
+    /* Scale to actual current */
+    i_buffer[sample_index] = i_adc * CURRENT_SCALE;
+
+
+    sample_index++;
+}
+/* =========================================================
+   COMPLETE PROCESSING FUNCTION
+   (Sampling → FFT → PQ → Protection → Energy)
+========================================================= */
+void full_processing(void *arg)
+{
+    while (1)
+    {
+
+    /* -------- START SAMPLING -------- */
+    sample_index = 0;
+    sampling_done = false;
+
+    esp_timer_stop(timer_handle);
+	esp_timer_start_periodic(timer_handle, TIMER_US);
+
+
+    while (!sampling_done)
+        vTaskDelay(pdMS_TO_TICKS(1));
+
+    /* -------- DC REMOVAL -------- */
+    float mean_v = 0, mean_i = 0;
+
+    for (int i = 0; i < FFT_N; i++)
+    {
+        mean_v += v_buffer[i];
+        mean_i += i_buffer[i];
+    }
+
+    mean_v /= FFT_N;
+    mean_i /= FFT_N;
+
+    for (int i = 0; i < FFT_N; i++)
+    {
+        v_buffer[i] -= mean_v;
+        i_buffer[i] -= mean_i;
+    }
+
+    /* -------- FFT -------- */
+    compute_fft(v_buffer, Re_v, Im_v, Mag_v);
+    compute_fft(i_buffer, Re_i, Im_i, Mag_i);
+
+    float freq_res = FS / FFT_N;
+    
+    max = 0.0f;
+	k_fund = 1;
+     for(int i=0;i<FFT_N/2;i++){
+		if(max < Mag_v[i]){
+			max = Mag_v[i];
+			k_fund = i;
+		}
+	}
+
+    float fund_freq = k_fund * freq_res;
+    freq = fund_freq;
+
+    /* =========================================================
+       CURRENT FUNDAMENTAL
+    ========================================================= */
+    int k_fund_i = 1;
+    float max_mag_i = Mag_i[1];
+
+    for (int k = 2; k < FFT_N/2; k++)
+    {
+        if (Mag_i[k] > max_mag_i)
+        {
+            max_mag_i = Mag_i[k];
+            k_fund_i = k;
+        }
+    }
+
+    float fund_freq_i = k_fund_i * freq_res;
+    freq_i = fund_freq_i;
+    
+    if (i_rms < 2.0f){i_rms = 0.0f;freq_i  = 0.0f; }
+
+    /* =========================================================
+       RMS CALCULATION
+    ========================================================= */
+v_rms = 0;
+i_rms = 0;
+
+for (int i = 0; i < FFT_N; i++)
+{
+    v_rms += v_buffer[i]*v_buffer[i];
+    i_rms += i_buffer[i]*i_buffer[i];
+}
+
+v_rms = sqrtf(v_rms/FFT_N);
+i_rms = sqrtf(i_rms/FFT_N);
+//if (relay_tripped == false){v_rms = v_rms / 1.09f ;}
+
+if (v_rms < 50.0f){ v_rms = 0.0f;}
+if (i_rms < 2.0f){ i_rms = 0.0f;}
+
+bool voltage_valid = (v_rms > 50.0f);
+bool current_valid = (i_rms > 2.0f);
+
+if (voltage_valid)
+{
+    instant_protection(i_rms, v_rms, freq);
+    idmt_protection(i_rms, v_rms);
+}
+
+    /* =========================================================
+       THD CALCULATION
+    ========================================================= */
+    float V1 = Mag_v[k_fund]/sqrtf(2);
+    float I1 = Mag_i[k_fund]/sqrtf(2);
+
+    thd_v = 0;
+    thd_i = 0;
+
+    for (int h=2; h<=5; h++)
+    {
+        int kh = h*k_fund;
+        if (kh < FFT_N/2)
+        {
+            thd_v += powf(Mag_v[kh]/sqrtf(2),2);
+            thd_i += powf(Mag_i[kh]/sqrtf(2),2);
+        }
+    }
+
+    thd_v = sqrtf(thd_v)/V1;
+    thd_i = sqrtf(thd_i)/I1;
+    
+    if (i_rms < 2.0f){thd_i = 0.0f;}
+    if (v_rms < 50.0f){thd_v = 0.0f;}
+
+    /* =========================================================
+       POWER CALCULATIONS
+    ========================================================= */
+    
+    P = 0;
+
+    for (int i=0;i<FFT_N;i++)
+        P += v_buffer[i]*i_buffer[i];
+
+    P /= FFT_N;
+    
+    if (-60.0f < P && P < 60.0f){
+		P = 0;
+	}
+
+    S = v_rms * i_rms;
+    Q = sqrtf(S*S - P*P);
+    PF = P/S;
+
+    /* -------- VOLTAGE SAG/SWELL -------- */
+if (v_rms < 0.9f * VNOM && v_rms > 0.1f * VNOM)
+{
+    strcpy(v_sag_status, "SAG");
+}
+else if (v_rms > 1.1f * VNOM)
+{
+    strcpy(v_sag_status, "SWELL");
+}
+else
+{
+    strcpy(v_sag_status, "NORMAL");
+}
+
+/* -------- CURRENT SAG/SWELL -------- */
+if (i_rms < 0.9f * INOM && i_rms > 0.1f * INOM)
+{
+    strcpy(i_sag_status, "SAG");
+}
+else if (i_rms > 1.1f * INOM)
+{
+    strcpy(i_sag_status, "SWELL");
+}
+else
+{
+    strcpy(i_sag_status, "NORMAL");
+}
+printf("\n--- SAG/SWELL STATUS ---\n");
+printf("Voltage : %s\n", v_sag_status);
+printf("Current : %s\n", i_sag_status);
+
+    fund_v = Mag_v[k_fund];
+	fund_i = Mag_i[k_fund_i];
+
+/* -------- LOW VOLTAGE CUTOFF -------- */
+if (v_rms < 50.0f){freq  = 0.0f; fund_v = 0.0f;   
+
+    P = 0.0f;
+    Q = 0.0f;
+    S = 0.0f;
+    PF = 0.0f;
+
+}
+
+if (i_rms < 1.0f)
+{
+    freq_i  = 0.0f; 
+    fund_i = 0.0f;    
+
+}
+
+    /* =========================================================
+       PROTECTION
+    ========================================================= */
+    printf("\n--- PROTECTION STATUS ---\n");
+
+    if (v_rms > OV_LIMIT) printf("OVER VOLTAGE!\n");
+    if (v_rms < UV_LIMIT && v_rms > 50.0f) printf("UNDER VOLTAGE!\n");
+    if (i_rms > OC_LIMIT) printf("OVER CURRENT!\n");
+    if (freq > OFREQ_LIMIT) printf("OVER FREQUENCY!\n");
+    if (freq < UFREQ_LIMIT && freq > 20.0f) printf("UNDER FREQUENCY!\n");
+
+    /* =========================================================
+       FFT PRINT
+    ========================================================= */
+    printf("\n--- FFT SPECTRUM (Voltage & Current) ---\n");
+    printf("Bin\tFreq(Hz)\t|V| (Peak)\t|I| (Peak)\n");
+
+    for (int k = 1; k < 8; k++)
+    {
+        float bin_freq = k * freq_res;
+
+        printf("%2d\t%7.2f\t\t%8.3f\t%8.3f\n",
+               k, bin_freq, Mag_v[k], Mag_i[k]);
+    }
+    
+    
+
+    /* =========================================================
+       FINAL OUTPUT
+    ========================================================= */
+    printf("\n--- PQ ANALYSIS ---\n");
+    printf("Voltage Frequency : %.2f Hz\n", freq);
+    printf("Current Frequency : %.2f Hz\n", freq_i);
+    printf("Vrms : %.2f V\n", v_rms);
+    printf("Irms : %.2f A\n", i_rms);
+    printf("THD V: %.2f %%\n", thd_v*100);
+    printf("THD I: %.2f %%\n", thd_i*100);
+    printf("Fund V  : %.2f V\n", fund_v/1.414);
+    printf("Fund I  : %.2f A\n", fund_i/1.414);
+    
+
+    printf("\n--- ENERGY METER ---\n");
+    printf("Active Power (P): %.2f W\n", P);
+    printf("Apparent Power(S): %.2f VA\n", S);
+    printf("Reactive Power(Q): %.2f VAR\n", Q);
+    printf("Power Factor     : %.3f\n", PF);
+    printf("\n----------------------------------------\n");
+    printf("OC_LIMIT    : %.3f\n", OC_LIMIT);
+    printf("OV_LIMIT    : %.3f\n", OV_LIMIT);
+    
+    printf("OC_INST_LIMIT  : %.3f\n", OC_INST_LIMIT);
+    printf("\n----------------------------------------\n");
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }}
+
+
+
+/* =========================================================
+   MAIN
+========================================================= */
+void app_main(void)
+{
+    printf("\n=== SMART PROTECTIVE RELAY + PQ + ENERGY METER ===\n");
+
+
+    /* -------- ADC INIT -------- */
+    adc_oneshot_unit_init_cfg_t adc_unit_cfg = {
+        .unit_id = ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE
+    };
+    adc_oneshot_new_unit(&adc_unit_cfg, &adc_handle);
+
+    adc_oneshot_chan_cfg_t adc_cfg = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12
+    };
+
+    adc_oneshot_config_channel(adc_handle, VOLTAGE_ADC_CHANNEL, &adc_cfg);
+    adc_oneshot_config_channel(adc_handle, CURRENT_ADC_CHANNEL, &adc_cfg);
+    adc_oneshot_config_channel(adc_handle, ADC_BTN_CH, &adc_cfg);
+
+
+    /* -------- LCD INIT -------- */
+    lcd_init();
+    lcd_clear();
+    
+    gpio_reset_pin(RELAY_GPIO);
+	gpio_set_direction(RELAY_GPIO, GPIO_MODE_OUTPUT);
+
+	/* Relay ON initially */
+	gpio_set_level(RELAY_GPIO, 0);   // ON
+
+    /* -------- TIMER INIT -------- */
+    esp_timer_create_args_t timer_args = {
+        .callback = sampling_timer_cb,
+        .name = "sampling_timer"
+    };
+    esp_timer_create(&timer_args, &timer_handle);
+/* -------- WIFI + WEBSERVER -------- */
+    wifi_init_sta();
+    
+
+
+    /* -------- CREATE TASKS -------- */
+    xTaskCreate(full_processing,
+                "full_processing",
+                8192,
+                NULL,
+                5,
+                NULL);
+
+    xTaskCreate(lcd_menu,
+                "lcd_menu",
+                4096,
+                NULL,
+                4,
+                NULL);
+}
